@@ -9,7 +9,7 @@ using Polly;
 using Polly.Extensions.Http;
 using Polly.Timeout;
 
-namespace hydra.Extensions
+namespace YourProject
 {
     /// <summary>
     /// The Policy Extension class.
