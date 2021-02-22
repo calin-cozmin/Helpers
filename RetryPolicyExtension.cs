@@ -24,6 +24,8 @@ namespace YourProjectNamespace
     /// </remarks>
     public static class PollyExtension
     {
+        private const string PolyRetryOnResultHeader = "x-poly-retry-on-result";
+
         /// <summary>
         /// This retry policy is used to retry async a piece of code.
         /// </summary>
@@ -66,51 +68,101 @@ namespace YourProjectNamespace
         /// <param name="onRetryAsyncFunc">This represents the delegate with the parameters obtained after each call. It can be used when it is configured in order to add you custom logic after the http call is done (log, do something else).</param>
         /// <param name="retryAttempts">Represents the number of retries of your http call.</param>
         /// <param name="httpStatusCodeToRetry">Represents a list of http status codes. You can add you own logic here (for which http codes the retry should happen). Be aware that default behaviour is to not retry an http call if the result code belongs to 2xx http status codes.</param>
-        /// <param name="onResultFunc">Represent the number of seconds for the HttpClient Timeout.</param>
+        /// <param name="onResultFunc">Represent a custom action which can be condigured at startup in order to execeute that specific action on the received http response message.</param>
         /// <param name="sleepDuration">Represent the number of seconds used to wait between http calls retries.</param>
         /// <param name="timeoutDurationPerPolicyRequest">Represent the number of seconds used to wait for each policy retry request. The exception thrown in case the request will overlap the value is  <see cref="T:Polly.Timeout.TimeoutRejectedException" />. In case this property is not set (null) then no timeout policy will be added to this http client.</param>
         /// <returns>The policy handlers with all the configurable rules.</returns>
         public static IHttpClientBuilder ConfigureRetryPolicy(
-            this IHttpClientBuilder builder,
-            Action<DelegateResult<HttpResponseMessage>, TimeSpan, int, Context> onRetryAsyncFunc = null,
-            int retryAttempts = 3,
-            IEnumerable<HttpStatusCode> httpStatusCodeToRetry = null,
-            Func<HttpResponseMessage, bool> onResultFunc = null,
-            TimeSpan? sleepDuration = null,
-            TimeSpan? timeoutDurationPerPolicyRequest = null)
+              this IHttpClientBuilder builder,
+              Func<DelegateResult<HttpResponseMessage>, TimeSpan, int, Context, Task> onRetryAsyncFunc = null,
+              int retryAttempts = 3,
+              IEnumerable<HttpStatusCode> httpStatusCodeToRetry = null,
+              Func<HttpResponseMessage, Task<bool>> onResultFuncAsync = null,
+              TimeSpan? sleepDuration = null,
+              TimeSpan? timeoutDurationPerPolicyRequest = null)
         {
-            var concreteTimeoutDurationPerPolicyRequest = GetConcreteTimeoutPerPolicyRequest(builder, timeoutDurationPerPolicyRequest);
-          
-            builder.AddPolicyHandler(BuildRetryPolicy(retryAttempts, concreteTimeoutDurationPerPolicyRequest, onRetryAsyncFunc, httpStatusCodeToRetry, onResultFunc, sleepDuration));
+            var concreteTimeoutDurationPerPolicyRequest = GetConcreteTimeoutPerPolicyRequest(timeoutDurationPerPolicyRequest);
 
-            builder.ChangeHttpClientTimoutValue(retryAttempts, sleepDuration, timeoutDurationPerPolicyRequest);
+            var timeOutPolicy = BuildTimeoutPolicy(concreteTimeoutDurationPerPolicyRequest);
+            var retryPolicy = BuildRetryPolicy(retryAttempts, onRetryAsyncFunc, httpStatusCodeToRetry, onResultFuncAsync, sleepDuration);
+
+            builder.AddPolicyHandler(retryPolicy);
+            builder.AddPolicyHandler(timeOutPolicy);
+
+            builder.ChangeHttpClientTimoutValue(retryAttempts, concreteTimeoutDurationPerPolicyRequest, sleepDuration);
 
             return builder;
         }
 
         private static IAsyncPolicy<HttpResponseMessage> BuildRetryPolicy(
             int retryAttempts,
-            TimeSpan timeoutDurationPerPolicyRequest,
-            Action<DelegateResult<HttpResponseMessage>, TimeSpan, int, Context> onRetryAsyncFunc,
+            Func<DelegateResult<HttpResponseMessage>, TimeSpan, int, Context, Task> onRetryAsyncFunc = null,
             IEnumerable<HttpStatusCode> httpStatusCodeToRetry = null,
-            Func<HttpResponseMessage, bool> onResultFunc = null,
+            Func<HttpResponseMessage, Task<bool>> onResultFuncAsync = null,
             TimeSpan? sleepDuration = null)
         {
-            var retryPolicy = 
-                Policy
-                .Handle<TimeoutRejectedException>()
-                .Or<HttpRequestException>()
-                .OrResult<HttpResponseMessage>(httpResponseMessage => RetryFor(httpStatusCodeToRetry, httpResponseMessage))
-                .OrResult(onResultFunc ?? (msg => false))
-                .WaitAndRetryAsync(
-                    retryAttempts,
-                    retryAttempt => sleepDuration.HasValue ? sleepDuration.Value : TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)),
-                    onRetryAsyncFunc
-                );
+            Polly.Retry.AsyncRetryPolicy<HttpResponseMessage> retryPolicy;
+            if (onRetryAsyncFunc == null)
+            {
+                retryPolicy = Policy<HttpResponseMessage>
+                    .Handle<TimeoutRejectedException>()
+                    .Or<HttpRequestException>()
+                    .OrResult(httpResponseMessage => RetryFor(httpStatusCodeToRetry, httpResponseMessage))
+                    .OrResult(httpResponseMessage => onResultFuncAsync != null && DoesHeadersContainsCustomPollyHeader(httpResponseMessage))
+                    .WaitAndRetryAsync(
+                        retryAttempts,
+                        retryAttempt => sleepDuration ?? TimeSpan.FromSeconds(Math.Pow(2, retryAttempt))
+                    );
+            }
+            else
+            {
+                retryPolicy = Policy<HttpResponseMessage>
+                    .Handle<TimeoutRejectedException>()
+                    .Or<HttpRequestException>()
+                    .OrResult(httpResponseMessage => RetryFor(httpStatusCodeToRetry, httpResponseMessage))
+                    .OrResult(httpResponseMessage => onResultFuncAsync != null && DoesHeadersContainsCustomPollyHeader(httpResponseMessage))
+                    .WaitAndRetryAsync(
+                        retryAttempts,
+                        retryAttempt => sleepDuration ?? TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)),
+                        onRetryAsyncFunc
+                    );
+            }
 
-            var timeOutPolicy = BuildTimeoutPolicy(timeoutDurationPerPolicyRequest);
-            return Policy.WrapAsync(retryPolicy, timeOutPolicy);
+            return GetFinalPolicy(retryPolicy, onResultFuncAsync);
+        }
 
+        private static IAsyncPolicy<HttpResponseMessage> GetFinalPolicy(Polly.Retry.AsyncRetryPolicy<HttpResponseMessage> retryPolicy, Func<HttpResponseMessage, Task<bool>> onResultFuncAsync = null)
+        {
+            if (onResultFuncAsync == null)
+            {
+                return retryPolicy;
+            }
+
+            var fallbackPolicy = BuildFallbackPolicy(onResultFuncAsync);
+            return retryPolicy.WrapAsync(fallbackPolicy);
+        }
+
+        private static IAsyncPolicy<HttpResponseMessage> BuildFallbackPolicy(Func<HttpResponseMessage, Task<bool>> onResultAsync)
+        {
+            var policy = Policy<HttpResponseMessage>
+                .HandleResult(r => !r.Headers.Contains(PolyRetryOnResultHeader))
+                .FallbackAsync(async (delegateOutcome, context, token) =>
+                {
+                    var httpResponseMessage = delegateOutcome.Result;
+                    var result = await onResultAsync(httpResponseMessage);
+                    httpResponseMessage.Headers.Add(PolyRetryOnResultHeader, result.ToString());
+
+                    return httpResponseMessage;
+                },
+                (delegateOutcome, context) => { return Task.CompletedTask; });
+
+            return policy;
+        }
+
+        private static bool DoesHeadersContainsCustomPollyHeader(HttpResponseMessage httpResponseMessage)
+        {
+            var result = httpResponseMessage.Headers.TryGetValues(PolyRetryOnResultHeader, out var vs) && vs.Any(v => v == true.ToString());
+            return result;
         }
 
         private static bool RetryFor(IEnumerable<HttpStatusCode> httpStatusCodeToRetry, HttpResponseMessage httpResponseMessage)
@@ -125,41 +177,27 @@ namespace YourProjectNamespace
 
         private static IAsyncPolicy<HttpResponseMessage> BuildTimeoutPolicy(TimeSpan retryTimeout)
         {
-            return Policy.TimeoutAsync<HttpResponseMessage>(timeout: retryTimeout, timeoutStrategy: TimeoutStrategy.Optimistic);
+            return Policy.TimeoutAsync<HttpResponseMessage>(timeout: retryTimeout, timeoutStrategy: TimeoutStrategy.Pessimistic);
         }
 
         private static void ChangeHttpClientTimoutValue(
             this IHttpClientBuilder builder,
             int retryAttempts,
-            TimeSpan? sleepDuration,
-            TimeSpan? timeoutDurationPerPolicyRequest)
+            TimeSpan timeoutDurationPerPolicyRequest,
+            TimeSpan? sleepDuration)
         {
             var durationBetweenRequests = CalculateDurationBetweenRequests(retryAttempts, sleepDuration);
 
-            if (timeoutDurationPerPolicyRequest.HasValue)
-            {
-                var calculatedHttpClientTimeout = durationBetweenRequests + retryAttempts * timeoutDurationPerPolicyRequest.Value;
-                builder.ConfigureHttpClient(client =>
-                {
-                    if (client.Timeout < calculatedHttpClientTimeout)
-                    {
-                        client.Timeout = calculatedHttpClientTimeout;
-                    }
-                });
-            }
-            else
-            { 
-                builder.ConfigureHttpClient(client =>
-                {
-                    var newRetryAttemps = retryAttempts + 1;
-                    var calculatedHttpClientTimeout = durationBetweenRequests + client.Timeout * newRetryAttemps;
+            var newRetryAttemps = retryAttempts + 1;
+            var calculatedHttpClientTimeout = durationBetweenRequests + newRetryAttemps * timeoutDurationPerPolicyRequest;
 
-                    if (client.Timeout < calculatedHttpClientTimeout)
-                    {
-                        client.Timeout = calculatedHttpClientTimeout;
-                    }
-                });
-            }
+            builder.ConfigureHttpClient(client =>
+            {
+                if (client.Timeout < calculatedHttpClientTimeout)
+                {
+                    client.Timeout = calculatedHttpClientTimeout;
+                }
+            });
         }
 
         private static TimeSpan CalculateDurationBetweenRequests(int retryAttempts, TimeSpan? sleepDuration)
@@ -181,7 +219,7 @@ namespace YourProjectNamespace
             return calculatedHttpClientTimeout;
         }
 
-        private static TimeSpan GetConcreteTimeoutPerPolicyRequest(IHttpClientBuilder builder, TimeSpan? timeoutDurationPerPolicyRequest = null)
+        private static TimeSpan GetConcreteTimeoutPerPolicyRequest(TimeSpan? timeoutDurationPerPolicyRequest = null)
         {
             if (timeoutDurationPerPolicyRequest.HasValue)
             {
@@ -192,7 +230,6 @@ namespace YourProjectNamespace
                 return TimeSpan.FromSeconds(100);
             }
         }
-
     }
 }
 
@@ -204,14 +241,19 @@ namespace YourProjectNamespace
 var retryAttempts = Configuration.GetSection("HttpClientPolicy:RetryAttempts").Get<int>();
 
 // Add http clients
-services.AddHttpClient<IYourService, YourService>().ConfigureRetryPolicy(
-                onRetryAsyncFunc: (httpResponseMessage, timeSpan, retryCount, context) =>
-                {
-                  Console.WriteLine($"{httpResponseMessage?.Exception?.Message} - {timeSpan.Seconds} - {retryCount} - {context.CorrelationId}");
-                },
-                retryAttempts: httpClientPolicyOptions.RetryAttempts,
-                httpStatusCodeToRetry: new List<HttpStatusCode>() { HttpStatusCode.BadGateway, HttpStatusCode.NotFound });
-	
+ILogger<YourService> logger;
+services.AddHttpClient<IYourService, YourService>((serviceProvider, httpClient) =>
+            {
+                logger = serviceProvider.GetService<ILogger<YourService>>();
+            })
+		.ConfigureRetryPolicy(
+		 onRetryAsyncFunc: async (httpResponseMessage, timeSpan, retryCount, context) =>
+		 {
+		     await Task.FromResult($"{httpResponseMessage}, {timeSpan}, {retryCount}, {context}, {leaseWaveLogger}");
+		 },
+		retryAttempts: httpClientPolicyOptions.RetryAttempts,
+		httpStatusCodeToRetry: new List<HttpStatusCode>() { HttpStatusCode.BadGateway },
+		onResultFuncAsync: async x => await // do something to check the httpresonsemessage result);
 
 // -------------------appSettings.json
  "HttpClientPolicy": {
