@@ -1,2 +1,2 @@
 # PollyExtension
-A much more configurable of Polly in asp .net core
+A much more configurable of Polly in .net standard 2.1
